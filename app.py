@@ -1,172 +1,31 @@
 import streamlit as st
 import os
 import toml
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict
 from dataclasses import dataclass
 from phi.agent import Agent
 from phi.model.groq import Groq
+from phi.tools.googlesearch import GoogleSearch
 from qdrant_client import QdrantClient
 from sentence_transformers import SentenceTransformer
 
-@dataclass
-class DocumentResponse:
-    content: str
-    confidence: float
-    metadata: Dict
-    is_doctor_info: bool = False
-
-class VectorDBService:
-    def __init__(self, api_url: str = None, api_key: str = None):
-        try:
-            if api_url and api_key:
-                self.client = QdrantClient(url=api_url, api_key=api_key)
-            else:
-                self.client = QdrantClient(":memory:")
-            self.model = SentenceTransformer('all-MiniLM-L6-v2')
-            self.collection_name = "myayurhealth_docs"
-        except Exception as e:
-            st.error(f"Vector DB Initialization Error: {str(e)}")
-            self.client = None
-            self.model = None
-    
-    def search(self, query: str, limit: int = 5) -> List[DocumentResponse]:
-        if not self.client or not self.model:
-            return []
-        
-        try:
-            query_vector = self.model.encode(query).tolist()
-            results = self.client.search(
-                collection_name=self.collection_name,
-                query_vector=query_vector,
-                limit=limit
-            )
-            
-            return [
-                DocumentResponse(
-                    content=result.payload.get('text', ''),
-                    confidence=float(result.score),
-                    metadata=result.payload.get('metadata', {}),
-                    is_doctor_info='doctor' in result.payload.get('metadata', {}).get('type', '').lower()
-                )
-                for result in results
-            ]
-        except Exception as e:
-            st.error(f"Search Error: {str(e)}")
-            return []
-
-class AyurvedaExpertSystem:
-    def __init__(self, config: Dict[str, str]):
-        self.vector_db = VectorDBService(
-            api_url=config.get("QDRANT_URL"),
-            api_key=config.get("QDRANT_API_KEY")
-        )
-        self.model = Agent(
-            model=Groq(id="llama-3.3-70b-versatile"),
-            description="Expert Ayurvedic healthcare assistant",
-            instructions=[
-                "Provide accurate Ayurvedic information based on available documentation",
-                "Only recommend doctors that are explicitly mentioned in the documentation",
-                "For health issues, explain Ayurvedic treatment approaches and recommend relevant doctors",
-                "Be clear when information comes from documentation versus general knowledge"
-            ]
-        )
-    
-    def process_doctor_query(self, query: str) -> Tuple[str, List[DocumentResponse]]:
-        docs = self.vector_db.search(query)
-        doctor_docs = [doc for doc in docs if doc.is_doctor_info]
-        
-        if not doctor_docs:
-            return ("I apologize, but I couldn't find any doctors matching your query in our platform. "
-                   "Please try a different search or contact our support team for assistance.", [])
-        
-        context = "\n".join([doc.content for doc in doctor_docs])
-        response = self.model.run(f"""
-        Based on the following doctor information from our platform, provide a clear response:
-        {context}
-        
-        Format the response to clearly list each available doctor with their specializations and qualifications.
-        """).content
-        
-        return response, doctor_docs
-
-    def process_health_query(self, query: str) -> Tuple[str, List[DocumentResponse]]:
-        # First search for condition-specific information
-        condition_docs = self.vector_db.search(query)
-        
-        # Then search for relevant doctors
-        doctor_docs = self.vector_db.search(f"doctor treating {query}")
-        doctor_docs = [doc for doc in doctor_docs if doc.is_doctor_info]
-        
-        all_docs = condition_docs + doctor_docs
-        
-        if not all_docs:
-            # Generate a general response if no specific documentation is found
-            response = self.model.run(f"""
-            Provide information about how Ayurveda approaches treating {query}. 
-            Include:
-            1. The Ayurvedic perspective on this condition
-            2. General treatment principles
-            3. Note that this is general information and specific treatment should be discussed with an Ayurvedic practitioner
-            """).content
-            return response, []
-        
-        # Combine documented information with doctor recommendations
-        context = "\n".join([doc.content for doc in all_docs])
-        response = self.model.run(f"""
-        Based on the following information from our platform, provide a comprehensive response about {query}:
-        {context}
-        
-        Include:
-        1. The Ayurvedic approach to treating this condition
-        2. Specific treatments or therapies mentioned in our documentation
-        3. Available doctors who specialize in treating this condition
-        
-        Only mention doctors explicitly listed in the provided information.
-        """).content
-        
-        return response, all_docs
-
-    def process_query(self, query: str) -> Tuple[str, List[DocumentResponse]]:
-        # Check if query is about doctors
-        if any(keyword in query.lower() for keyword in ['doctor', 'practitioner', 'physician', 'vaidya']):
-            return self.process_doctor_query(query)
-        
-        # Check if query is about health conditions
-        elif any(keyword in query.lower() for keyword in ['treat', 'cure', 'healing', 'medicine', 'therapy', 'disease', 'condition', 'problem', 'pain']):
-            return self.process_health_query(query)
-        
-        # General query
-        docs = self.vector_db.search(query)
-        if not docs:
-            response = self.model.run(f"""
-            Provide accurate general information about {query} from an Ayurvedic perspective.
-            Note that this is general knowledge and specific health advice should be sought from qualified practitioners.
-            """).content
-            return response, []
-        
-        context = "\n".join([doc.content for doc in docs])
-        response = self.model.run(f"""
-        Based on the following information from our documentation, provide a response about {query}:
-        {context}
-        
-        Ensure the response is accurate and based only on the provided information.
-        """).content
-        
-        return response, docs
-
+# Configuration handling
 def load_config():
+    """Load configuration from multiple possible sources"""
     config = {
-        "QDRANT_URL": "http://localhost:6333",
-        "QDRANT_API_KEY": ""
+        "QDRANT_URL": "API",  # default values
+        "QDRANT_API_KEY": "API"
     }
     
+    # Try loading from secrets.toml in current directory
     try:
         with open("secrets.toml", "r") as f:
             toml_config = toml.load(f)
             config.update(toml_config)
     except FileNotFoundError:
-        st.warning("secrets.toml not found. Using default or environment variables.")
+        st.warning("secrets.toml not found in current directory. Using default or environment variables.")
     
+    # Override with environment variables if they exist
     for key in config:
         env_value = os.getenv(key)
         if env_value:
@@ -174,36 +33,192 @@ def load_config():
     
     return config
 
+@dataclass
+class AgentResponse:
+    source: str
+    content: str
+    confidence: float = 1.0
+
+class AyurvedaResearchAgent:
+    def __init__(self):
+        self.agent = Agent(
+            model=Groq(id="llama-3.3-70b-versatile"),
+            tools=[GoogleSearch()],
+            description="Expert Ayurveda research assistant",
+            instructions=[
+                "Search for authoritative information about Ayurvedic topics",
+                "Focus on scientific validation and clinical studies",
+                "Provide detailed analysis with references",
+            ],
+            show_tool_calls=True
+        )
+    
+    def process(self, query: str) -> AgentResponse:
+        try:
+            response = self.agent.run(f"Research the following Ayurvedic topic and provide detailed information: {query}")
+            return AgentResponse(
+                source="Research",
+                content=response.content
+            )
+        except Exception as e:
+            st.error(f"Research Agent Error: {str(e)}")
+            return AgentResponse(
+                source="Research",
+                content="Unable to process research query at this time."
+            )
+
+class AyurvedaDocumentAgent:
+    def __init__(self, api_url: str = None, api_key: str = None):
+        try:
+            if api_url and api_key:
+                self.client = QdrantClient(url=api_url, api_key=api_key)
+            else:
+                self.client = QdrantClient(":memory:")  # Use in-memory storage for testing
+            self.model = SentenceTransformer('all-MiniLM-L6-v2')
+            self.collection_name = "myayurhealth_docs"
+        except Exception as e:
+            st.error(f"Document Agent Initialization Error: {str(e)}")
+            self.client = None
+            self.model = None
+
+    def process(self, query: str) -> List[AgentResponse]:
+        if not self.client or not self.model:
+            return [AgentResponse(
+                source="Documentation",
+                content="Document retrieval system is not available.",
+                confidence=0.0
+            )]
+        
+        try:
+            query_vector = self.model.encode(query).tolist()
+            results = self.client.search(
+                collection_name=self.collection_name,
+                query_vector=query_vector,
+                limit=3
+            )
+            
+            return [
+                AgentResponse(
+                    source="Documentation",
+                    content=result.payload['text'],
+                    confidence=float(result.score)
+                )
+                for result in results
+            ]
+        except Exception as e:
+            st.error(f"Document Search Error: {str(e)}")
+            return [AgentResponse(
+                source="Documentation",
+                content="Unable to search documents at this time.",
+                confidence=0.0
+            )]
+
+class AyurvedaGenerationAgent:
+    def __init__(self):
+        self.agent = Agent(
+            model=Groq(id="llama-3.3-70b-versatile"),
+            description="Ayurvedic knowledge synthesis specialist",
+            instructions=[
+                "Synthesize information from multiple sources",
+                "Provide practical, actionable insights",
+                "Maintain authenticity of Ayurvedic principles",
+                "Create clear, structured responses"
+            ]
+        )
+    
+    def process(self, query: str, context: List[str]) -> AgentResponse:
+        try:
+            combined_prompt = f"""
+            Query: {query}
+            
+            Context Information:
+            {' '.join(context)}
+            
+            Based on the above information, provide a comprehensive, well-structured response that:
+            1. Synthesizes key points from all sources
+            2. Highlights practical applications
+            3. Notes any areas of consensus or disagreement
+            4. Provides actionable recommendations
+            """
+            
+            response = self.agent.run(combined_prompt)
+            return AgentResponse(
+                source="Synthesis",
+                content=response.content
+            )
+        except Exception as e:
+            st.error(f"Generation Agent Error: {str(e)}")
+            return AgentResponse(
+                source="Synthesis",
+                content="Unable to generate synthesis at this time."
+            )
+
+class IntegratedAyurvedaAssistant:
+    def __init__(self, config: Dict[str, str]):
+        self.research_agent = AyurvedaResearchAgent()
+        self.document_agent = AyurvedaDocumentAgent(
+            api_url=config.get("QDRANT_URL"),
+            api_key=config.get("QDRANT_API_KEY")
+        )
+        self.generation_agent = AyurvedaGenerationAgent()
+    
+    def process_query(self, query: str) -> Dict[str, AgentResponse]:
+        research_response = self.research_agent.process(query)
+        doc_responses = self.document_agent.process(query)
+        
+        context = [
+            research_response.content,
+            *[resp.content for resp in doc_responses]
+        ]
+        
+        synthesis_response = self.generation_agent.process(query, context)
+        
+        return {
+            "research": research_response,
+            "documentation": doc_responses,
+            "synthesis": synthesis_response
+        }
+
+def display_response(response: AgentResponse, container):
+    container.markdown(f"**Confidence Score:** {response.confidence:.2f}" if response.confidence != 1.0 else "")
+    container.markdown(response.content)
+
 def main():
-    st.set_page_config(page_title="Ayurveda Expert System", layout="wide")
-    st.title("Ayurveda Expert System")
-    
+    st.set_page_config(page_title="Integrated Ayurveda Assistant", layout="wide")
+    st.title("Integrated Ayurveda Assistant")
+
+    # Load configuration
     config = load_config()
-    expert_system = AyurvedaExpertSystem(config)
-    
-    query = st.text_input("What would you like to know about Ayurvedic healthcare?")
-    
+
+    # Initialize the assistant
+    assistant = IntegratedAyurvedaAssistant(config)
+
+    # Query input
+    query = st.text_input("Enter your Ayurvedic health query:")
+
     if st.button("Submit"):
         if not query:
             st.warning("Please enter a query.")
             return
-            
+
         with st.spinner("Processing your query..."):
-            response, docs = expert_system.process_query(query)
+            results = assistant.process_query(query)
+
+            col1, col2 = st.columns(2)
+
+            with col1:
+                st.markdown("### Research Findings")
+                display_response(results["research"], st)
             
-            # Display main response
-            st.markdown("### Response")
-            st.write(response)
-            
-            # Display source documents if available
-            if docs:
-                st.markdown("### Supporting Information")
-                for idx, doc in enumerate(docs, 1):
-                    with st.expander(f"Source {idx} (Confidence: {doc.confidence:.2f})"):
-                        st.write(doc.content)
-                        if doc.metadata:
-                            st.markdown("**Metadata:**")
-                            st.json(doc.metadata)
+            with col2:
+                st.markdown("### Documentation Matches")
+                for idx, doc_response in enumerate(results["documentation"], 1):
+                    with st.expander(f"Document Match {idx}"):
+                        display_response(doc_response, st)
+
+            st.markdown("### 🔍 Comprehensive Analysis")
+            st.info("This analysis combines insights from all sources")
+            display_response(results["synthesis"], st)
 
 if __name__ == "__main__":
     main()

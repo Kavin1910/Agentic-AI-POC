@@ -1,0 +1,5 @@
+streamlit
+toml
+qdrant-client
+sentence-transformers
+phi

@@ -3,3 +3,4 @@ toml
 qdrant-client
 sentence-transformers
 phi
+groq
